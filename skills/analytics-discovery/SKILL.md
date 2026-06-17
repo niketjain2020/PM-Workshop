@@ -1,6 +1,6 @@
 ---
 name: analytics-discovery
-version: 1.0.0
+version: 1.1.0
 description: Discover telemetry for any product feature by inspecting Superset dashboards, running direct SQL event discovery, auto-categorizing events, and generating a structured events.md file ready for funnel/retention/health analysis.
 ---
 
@@ -20,6 +20,57 @@ The output `events.md` becomes the foundation for all downstream analysis (funne
 ## Keywords
 
 discovery, events, telemetry, event definition, instrumentation, events.md, discover events, what events, coverage, gaps, missing events, feature telemetry, dashboard
+
+---
+
+## Step 0: Prerequisites & Tool Availability Check
+
+Before doing anything else, determine which execution mode to use.
+
+### Check for Playwright MCP
+
+Test if Playwright MCP tools are available by checking for any tool matching `mcp__playwright__*` (e.g., `mcp__playwright__browser_navigate`). Use the tool_search_tool_regex function to search for pattern `playwright`.
+
+**Decision tree:**
+
+```
+Playwright MCP tools found?
+├── YES → Full Mode (browser + SQL)
+│   • Dashboard extraction (Steps 2, 2b) ✅
+│   • In-browser SQL via JS fetch ✅
+│   • Fallback to nezha-query if browser SQL fails
+│
+└── NO → SQL-Only Mode (nezha-query Python fallback)
+    • Dashboard extraction SKIPPED (tell user)
+    • SQL via: python "<NEZHA_SKILL_DIR>\query.py" "<SQL>"
+    • NEZHA_SKILL_DIR = C:\Users\nikj\.copilot\skills\nezha-query
+```
+
+### If Playwright MCP is NOT available
+
+1. **Announce the mode** to the user:
+   > ⚠️ Playwright MCP is not connected. Running in **SQL-Only mode**.
+   > Dashboard inspection (chart titles, View Query) will be skipped.
+   > SQL discovery will use the `nezha-query` Python skill instead.
+   >
+   > To enable full mode (dashboard extraction), restart with Playwright MCP connected.
+   > It's configured in `.mcp.json` — if it failed to start, check that `npx @playwright/mcp` works.
+
+2. **Skip Steps 1, 2, and 2b entirely** — go straight to asking the user for keywords.
+
+3. **For Step 3 (SQL discovery)**, use this pattern instead of in-browser JS:
+
+```powershell
+python "C:\Users\nikj\.copilot\skills\nezha-query\query.py" "<SQL_QUERY>"
+```
+
+The Python skill handles auth (opens browser for SSO on first run, caches cookies after), CSRF tokens, and query execution automatically. No manual CSRF step needed.
+
+### If Playwright MCP IS available
+
+Proceed with the full flow (Steps 1 → 2 → 2b → 3 → ...) as documented below. Use Playwright MCP for dashboard navigation and in-browser JS execution.
+
+---
 
 ## Before Starting, Ask
 
@@ -47,6 +98,8 @@ Do not proceed until feature area and platform are provided. Dashboard links OR 
 
 ### Step 1: Verify Auth & Connection
 
+**Full Mode (Playwright MCP available):**
+
 1. Navigate to `https://www.microsoftnezha.com/sqllab/`
 2. Retrieve CSRF token:
 
@@ -61,11 +114,25 @@ async () => {
 
 3. If `NEEDS_LOGIN`: prompt user to log in manually, then retry.
 
+**SQL-Only Mode (nezha-query fallback):**
+
+Run a simple test query to verify auth:
+
+```powershell
+python "C:\Users\nikj\.copilot\skills\nezha-query\query.py" "SELECT 1 as test"
+```
+
+- If it succeeds: auth is valid (cached cookies from prior session).
+- If it opens a browser for SSO: let it complete, then proceed.
+- If it errors with "state-save did not create state file": the browser opened but state wasn't captured. Ask user to run it manually once: `python "C:\Users\nikj\.copilot\skills\nezha-query\query.py" "SELECT 1 as test" --force-auth`
+
 **Output:** `Auth Status: ✅ Connected` or `❌ Needs Login`
 
 ---
 
 ### Step 2: Extract Keywords from Dashboard (if provided)
+
+> **⚠️ Requires Full Mode (Playwright MCP).** In SQL-Only mode, skip this step and ask the user for 2-3 keyword patterns instead.
 
 If user provided dashboard links:
 
@@ -84,6 +151,8 @@ If user provided keywords directly, skip this step.
 ---
 
 ### Step 2b: View Query on 2-3 Key Charts (if dashboard provided)
+
+> **⚠️ Requires Full Mode (Playwright MCP).** In SQL-Only mode, skip entirely.
 
 After extracting keywords, open "View Query" on 2-3 of the most relevant charts (preferably funnel charts, breakdown charts, or the most complex ones). This reveals:
 - **Property columns** used for breakdowns (not discoverable via keyword search alone)
@@ -155,11 +224,11 @@ document.querySelector('.ant-modal .ant-modal-close, .ant-modal-close-x')?.click
 
 ### Step 3: Direct SQL Event Discovery
 
-This is the core technique. Run discovery queries using keywords from Step 2.
+This is the core technique. Run discovery queries using keywords from Step 2 (or user-provided keywords in SQL-Only mode).
 
 #### 3a. Discover event names by keyword
 
-For each keyword pattern, run:
+**Full Mode (Playwright MCP)** — run in-browser:
 
 ```js
 async () => {
@@ -181,6 +250,17 @@ async () => {
   return JSON.stringify((await r.json()).data);
 }
 ```
+
+**SQL-Only Mode (nezha-query)** — run via Python:
+
+```powershell
+python "C:\Users\nikj\.copilot\skills\nezha-query\query.py" "SELECT DISTINCT event_name, count() as volume FROM odsp.usage_event WHERE toDate(event_time) >= '{{2_WEEKS_AGO}}' AND toDate(event_time) < '{{TODAY}}' AND dataset_name {{PLATFORM_FILTER}} AND event_name ILIKE '%{{KEYWORD}}%' GROUP BY event_name ORDER BY volume DESC LIMIT 100"
+```
+
+**Tips for SQL-Only mode:**
+- Run multiple keyword queries in parallel (separate powershell calls)
+- Use `--output results.json` to capture output for large result sets
+- Auth is automatic after first successful login
 
 **Platform filters:**
 - iOS: `= 'iOS'`
@@ -426,17 +506,19 @@ GROUP BY week ORDER BY week
 ## Guardrails
 
 1. **Always ask for feature area + platform** before starting.
-2. **Keep scoped** — one feature area, not the full product.
-3. **Hybrid approach**: keyword discovery first (fast, complete), then View Query on 2-3 charts (reveals properties & filters).
-4. **Never mix `uniqExactIf` and `countIf`** in the same query — ClickHouse distributed engine errors.
-5. **Keep queries under ~2KB** — proxy body size limit causes HTTP 500.
-6. **Use `toDate(event_time)`** for date filtering — no `event_date` column exists.
-7. **Always validate with user** before generating events.md — don't assume funnel ordering.
-8. **Don't trust event names alone** — verify with volume. Zero-volume events may be deprecated.
-9. **Database ID: 301, Schema: odsp** — always use these values for Superset API calls.
-10. **If dashboard is inaccessible**, fall back to keyword-based discovery (never block on dashboard).
-11. **View Query limit: 2-3 charts max** — pick funnel, breakdown, or "by Type" charts. More is diminishing returns.
-12. **Watch for SAMPLE clauses** in View Query results — dashboard may show estimates (×10, ×100). Note this in events.md.
+2. **Always run Step 0 (tool check)** — determine Full vs SQL-Only mode before proceeding.
+3. **Keep scoped** — one feature area, not the full product.
+4. **Hybrid approach**: keyword discovery first (fast, complete), then View Query on 2-3 charts (reveals properties & filters). In SQL-Only mode, keyword discovery is the only approach.
+5. **Never mix `uniqExactIf` and `countIf`** in the same query — ClickHouse distributed engine errors.
+6. **Keep queries under ~2KB** — proxy body size limit causes HTTP 500.
+7. **Use `toDate(event_time)`** for date filtering — no `event_date` column exists.
+8. **Always validate with user** before generating events.md — don't assume funnel ordering.
+9. **Don't trust event names alone** — verify with volume. Zero-volume events may be deprecated.
+10. **Database ID: 301, Schema: odsp** — always use these values for Superset API calls.
+11. **If dashboard is inaccessible**, fall back to keyword-based discovery (never block on dashboard).
+12. **View Query limit: 2-3 charts max** — pick funnel, breakdown, or "by Type" charts. More is diminishing returns.
+13. **Watch for SAMPLE clauses** in View Query results — dashboard may show estimates (×10, ×100). Note this in events.md.
+14. **SQL-Only mode**: If `nezha-query` auth fails, ask user to run `python "C:\Users\nikj\.copilot\skills\nezha-query\query.py" "SELECT 1" --force-auth` manually to bootstrap SSO cookies.
 
 ## Timing Guide (for workshop use)
 
