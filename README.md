@@ -2,9 +2,6 @@
 
 Claude Code skills and workshop materials for product management workflows — from data question to shareable insight in minutes.
 
-## Workshop
-
-📄 **[Agency Copilot Workshop Agenda](./workshop/agency_copilot_workshop_agenda.docx)** — 90-minute hands-on session
 
 ### What You'll Learn
 
